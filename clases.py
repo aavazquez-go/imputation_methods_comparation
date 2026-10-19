@@ -7,7 +7,12 @@ import seaborn as sns
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import SimpleImputer, IterativeImputer
 # from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
+from sklearn.model_selection import (
+    cross_val_score, 
+    StratifiedKFold, 
+    KFold, 
+    train_test_split
+)
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.pipeline import Pipeline
@@ -16,6 +21,15 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from sklearn.linear_model import BayesianRidge
+import copy
+
+# Intentar importar Optuna
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except Exception as e:
+    print(f'Optuna no disponible: {e}')
+    OPTUNA_AVAILABLE = False
 
 # Colores del tema editorial
 COLORS = {
@@ -508,8 +522,119 @@ class ImputationExperiment:
         complete_rows_mask = ~np.isnan(X).any(axis=1)
         
         print(f"ImputationExperiment:_select_not_missing_values_tuples - Encontrados {np.sum(complete_rows_mask)} registros completos de un total de {X.shape[0]}.")
-        
+
         return X[complete_rows_mask]
+    
+    def _build_imputer_with_params(self, method_name, params):
+        """
+        Construye una instancia de imputador con parámetros específicos.
+        
+        Args:
+            method_name: Nombre del método
+            params: Dict con parámetros
+        
+        Returns:
+            Imputador instanciado
+        """
+        method_name_lower = method_name.lower()
+        
+        if method_name_lower == 'mean':
+            return SimpleImputer(strategy='mean')
+        elif method_name_lower == 'median':
+            return SimpleImputer(strategy='median')
+        elif method_name_lower == 'most_frequent':
+            return SimpleImputer(strategy='most_frequent')
+        elif method_name_lower == 'miss_forest':
+            from sklearn.ensemble import RandomForestRegressor
+            return MissForestWrapper(
+                n_estimators=params.get('n_estimators', 30),
+                max_iter=params.get('max_iter', 3),
+                random_state=params.get('random_state', self.random_state),
+                n_jobs=params.get('n_jobs', 2)
+            )
+        elif method_name_lower == 'mice_hgb':
+            return IterativeImputer(
+                estimator=BayesianRidge(),
+                max_iter=params.get('max_iter', 3),
+                random_state=params.get('random_state', self.random_state),
+                sample_posterior=params.get('sample_posterior', False),
+                n_nearest_features=params.get('n_nearest_features', None)
+            )
+        elif method_name_lower == 'gain':
+            return GAIN(
+                epochs=params.get('epochs', 100),
+                batch_size=params.get('batch_size', 256),
+                hint_rate=params.get('hint_rate', 0.9),
+                alpha=params.get('alpha', 100),
+                lr=params.get('lr', 1e-3),
+                seed=params.get('seed', self.random_state)
+            )
+        elif method_name_lower == 'soft_impute':
+            return SoftImputeCustom(
+                max_iters=params.get('max_iters', 100),
+                threshold=params.get('threshold', 1e-3),
+                verbose=False
+            )
+        else:
+            # Fallback: devolver el configurado por defecto
+            if method_name in self.imputation_methods:
+                return copy.deepcopy(self.imputation_methods[method_name])
+            return SimpleImputer(strategy='mean')
+    
+    def _evaluate_imputation_on_data(self, imputer, X_missing, y_ground_truth, scaler_fitted=None):
+        """
+        Evalúa un imputador ya ajustado sobre datos con missing, comparando 
+        únicamente en las posiciones NaN contra y_ground_truth (completo).
+        
+        Args:
+            imputer: Imputador ajustado o callable (fit_transform)
+            X_missing: np.ndarray con NaN
+            y_ground_truth: np.ndarray completo (ground truth)
+            scaler_fitted: MinMaxScaler ya ajustado (opcional). Si se pasa, 
+                           se usará para escalar y_ground_truth antes de comparar.
+        
+        Returns:
+            dict con mse, mae, r2
+        """
+        # Determinar si es transductivo
+        is_transductive = isinstance(imputer, (GAIN, SoftImputeCustom, MissForestWrapper))
+        
+        if scaler_fitted is not None:
+            X_m_scaled = scaler_fitted.transform(X_missing)
+            y_gt_scaled = scaler_fitted.transform(y_ground_truth)
+        else:
+            X_m_scaled = X_missing.copy()
+            y_gt_scaled = y_ground_truth.copy()
+        
+        # Imputar
+        if is_transductive:
+            try:
+                X_imp_scaled = imputer.fit_transform(X_m_scaled)
+            except Exception:
+                X_imp_scaled = imputer.transform(X_m_scaled)
+        else:
+            try:
+                X_imp_scaled = imputer.transform(X_m_scaled)
+            except Exception:
+                X_imp_scaled = imputer.fit_transform(X_m_scaled)
+        
+        # Métricas solo en posiciones NaN
+        missing_mask = np.isnan(X_missing)
+        if not np.any(missing_mask):
+            # Si no hay NaN, devolver NaN o 0? pero no esperado
+            return {'mse': np.nan, 'mae': np.nan, 'r2': np.nan}
+        
+        original_values = y_gt_scaled[missing_mask]
+        imputed_values = X_imp_scaled[missing_mask]
+        
+        mse = mean_squared_error(original_values, imputed_values)
+        mae = mean_absolute_error(original_values, imputed_values)
+        try:
+            r2 = r2_score(original_values, imputed_values)
+        except Exception:
+            r2 = np.nan
+        
+        return {'mse': mse, 'mae': mae, 'r2': r2}
     
     ## ------------------------------------
     ## 2. Métodos de Evaluación y Ejecución
@@ -770,4 +895,379 @@ class ImputationExperiment:
         for i, (_, row) in enumerate(df_r2.iterrows(), 1):
             print(f"{i:2d}. {row['Método']:<20} | R²: {row['R² Media']:.4f} ± {row['R² Std']:.4f}")
         
+        return df
+
+    def tune_with_optuna(self, method_name, X_train_missing, y_train_ground_truth, 
+                        inner_cv_splits=5, n_trials=30, metric='mse', random_state=None):
+        """
+        Realiza búsqueda de hiperparámetros con Optuna usando solo el conjunto de entrenamiento (70%).
+        Usa 5-CV interno: SOLO los folds de entrenamiento se usan para búsqueda.
+        
+        Args:
+            method_name: Nombre del método a tunear
+            X_train_missing: Datos de train con NaN artificiales
+            y_train_ground_truth: Ground truth completo del train
+            inner_cv_splits: Número de folds internos (5 por defecto)
+            n_trials: Número de trials de Optuna
+            metric: 'mse' (minimizar), 'mae' (minimizar), 'r2' (maximizar)
+            random_state: Semilla para reproducibilidad
+        
+        Returns:
+            tuple (best_params, best_score)
+        """
+        if not OPTUNA_AVAILABLE:
+            print("Optuna no está disponible. Usando parámetros por defecto.")
+            # Devolver params por defecto según método
+            defaults = {}
+            if method_name.lower() == 'miss_forest':
+                defaults = {'n_estimators': 30, 'max_iter': 3, 'random_state': self.random_state, 'n_jobs': 2}
+            elif method_name.lower() == 'mice_hgb':
+                defaults = {'max_iter': 3, 'sample_posterior': False, 'n_nearest_features': None}
+            elif method_name.lower() == 'gain':
+                defaults = {'epochs': 100, 'batch_size': 256, 'hint_rate': 0.9, 'alpha': 100, 'lr': 1e-3, 'seed': self.random_state}
+            elif method_name.lower() == 'soft_impute':
+                defaults = {'max_iters': 100, 'threshold': 1e-3}
+            else:
+                defaults = {}
+            return defaults, np.inf if metric != 'r2' else -np.inf
+        
+        rs = random_state if random_state is not None else self.random_state
+        inner_cv = KFold(n_splits=inner_cv_splits, shuffle=True, random_state=rs)
+        
+        def objective(trial):
+            params = {}
+            method_name_lower = method_name.lower()
+            
+            if method_name_lower == 'miss_forest':
+                params = {
+                    'n_estimators': trial.suggest_int('n_estimators', 10, 100),
+                    'max_iter': trial.suggest_int('max_iter', 2, 5),
+                    'random_state': rs,
+                    'n_jobs': 2
+                }
+            elif method_name_lower == 'mice_hgb':
+                params = {
+                    'max_iter': trial.suggest_int('max_iter', 2, 10),
+                    'sample_posterior': trial.suggest_categorical('sample_posterior', [False, True]),
+                    'n_nearest_features': trial.suggest_categorical('n_nearest_features', [None, 2, 3, 5])
+                }
+            elif method_name_lower == 'gain':
+                params = {
+                    'epochs': trial.suggest_int('epochs', 20, 150),
+                    'batch_size': trial.suggest_categorical('batch_size', [64, 128, 256, 512]),
+                    'hint_rate': trial.suggest_float('hint_rate', 0.7, 0.95),
+                    'alpha': trial.suggest_float('alpha', 10, 200),
+                    'lr': trial.suggest_float('lr', 1e-4, 1e-2, log=True),
+                    'seed': rs
+                }
+            elif method_name_lower == 'soft_impute':
+                params = {
+                    'max_iters': trial.suggest_int('max_iters', 10, 150),
+                    'threshold': trial.suggest_float('threshold', 1e-4, 1e-2, log=True)
+                }
+            else:
+                params = {}
+            
+            # Evaluar con CV interno
+            fold_scores = []
+            is_transductive = method_name_lower in ['gain', 'soft_impute', 'miss_forest']
+            
+            for tr_idx, val_idx in inner_cv.split(X_train_missing, y_train_ground_truth):
+                X_tr_f = X_train_missing[tr_idx]
+                X_val_f = X_train_missing[val_idx]
+                y_tr_f = y_train_ground_truth[tr_idx]
+                y_val_f = y_train_ground_truth[val_idx]
+                
+                imputer_trial = self._build_imputer_with_params(method_name, params)
+                scaler = MinMaxScaler()
+                
+                if is_transductive:
+                    # Ajustar scaler solo con train
+                    X_tr_f_s = scaler.fit_transform(X_tr_f)
+                    # Para métodos transductivos, evaluamos aplicando fit_transform sobre val
+                    # (manteniendo comportamiento coherente con evaluate_imputation_method)
+                    X_val_f_s = scaler.transform(X_val_f)
+                    y_val_f_s = scaler.transform(y_val_f)
+                    try:
+                        X_val_imp_s = imputer_trial.fit_transform(X_val_f_s)
+                    except Exception:
+                        X_val_imp_s = imputer_trial.transform(X_val_f_s)
+                    # Métricas
+                    msk = np.isnan(X_val_f)
+                    if np.any(msk):
+                        orig = y_val_f_s[msk]
+                        impv = X_val_imp_s[msk]
+                        if metric == 'mse':
+                            fold_scores.append(mean_squared_error(orig, impv))
+                        elif metric == 'mae':
+                            fold_scores.append(mean_absolute_error(orig, impv))
+                        elif metric == 'r2':
+                            try:
+                                fold_scores.append(r2_score(orig, impv))
+                            except Exception:
+                                pass
+                else:
+                    pipe = Pipeline([
+                        ('scaler', MinMaxScaler()),
+                        ('imputer', imputer_trial)
+                    ])
+                    pipe.fit(X_tr_f)
+                    X_val_imp = pipe.transform(X_val_f)
+                    scaler_p = pipe.named_steps['scaler']
+                    y_val_f_s = scaler_p.transform(y_val_f)
+                    msk = np.isnan(X_val_f)
+                    if np.any(msk):
+                        orig = y_val_f_s[msk]
+                        impv = X_val_imp[msk]
+                        if metric == 'mse':
+                            fold_scores.append(mean_squared_error(orig, impv))
+                        elif metric == 'mae':
+                            fold_scores.append(mean_absolute_error(orig, impv))
+                        elif metric == 'r2':
+                            try:
+                                fold_scores.append(r2_score(orig, impv))
+                            except Exception:
+                                pass
+            
+            if len(fold_scores) == 0:
+                return np.inf if metric != 'r2' else -np.inf
+            score_mean = np.mean(fold_scores)
+            return score_mean if metric != 'r2' else -score_mean  # Optuna maximiza, invertimos si minimizar
+        
+        direction = 'maximize' if metric == 'r2' else 'minimize'
+        study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=rs))
+        study.optimize(objective, n_trials=n_trials)
+        
+        best_params = study.best_params
+        best_score = study.best_value
+        if metric == 'r2':
+            best_score = -best_score
+        
+        print(f"Optuna completado para {method_name}: best_{metric}={best_score:.4f}, best_params={best_params}")
+        return best_params, best_score
+    
+    def run_experiment_repeated_holdout(self, X, y=None, missing_rate=0.2, test_size=0.3,
+                                       n_repeats=5, inner_cv_splits=5, n_trials_optuna=30,
+                                       tune_methods=None, metric='mse', random_state=None):
+        """
+        Ejecuta esquema: Hold-out 70/30 repetido + 5-CV interno con Optuna (solo train).
+        Para cada repetición:
+        1. Split 70/30 aleatorio (cambia cada repetición)
+        2. Introducir missing artificial en train y test (independiente)
+        3. Con 70% hacer búsqueda de HP vía Optuna usando solo train (inner CV)
+        4. Reentrenar con TODO el 70% usando mejores HP
+        5. Evaluar en 30% test reservado (métricas solo sobre posiciones NaN) -> valor usado
+        6. Repetir n_repeats veces, promediar resultados
+        
+        Args:
+            X: Datos completos o con NaN (se extraen completos)
+            y: Opcional, si None usa X.copy()
+            missing_rate: % de missing artificial
+            test_size: 0.3 para 70/30
+            n_repeats: Nº repeticiones (5–30 según coste)
+            inner_cv_splits: Nº folds internos (5)
+            n_trials_optuna: Nº trials Optuna
+            tune_methods: Lista de métodos a tunear. Si None, tunear ['miss_forest', 'mice_hgb', 'gain', 'soft_impute']
+            metric: Métrica objetivo para Optuna ('mse','mae','r2')
+            random_state: Semilla base
+        
+        Returns:
+            dict con resultados por repetición y agregados
+        """
+        print("="*70)
+        print("EXPERIMENTO: Hold-out 70/30 repetido + Inner CV + Optuna")
+        print("="*70)
+        
+        rs_base = random_state if random_state is not None else self.random_state
+        rng = np.random.default_rng(rs_base)
+        
+        # Extraer completos
+        X_complete = self._select_not_missing_values_tuples(X)
+        if X_complete.shape[0] == 0:
+            raise ValueError("No se encontraron registros completamente observados")
+        
+        if tune_methods is None:
+            tune_methods = ['miss_forest', 'mice_hgb', 'gain', 'soft_impute']
+        
+        # Métodos a evaluar (tuneados) + mantener simples sin tune? evaluar también simples con params por defecto
+        methods_to_eval = list(self.imputation_methods.keys())
+        
+        # Estructura resultados
+        results_by_repeat = {m: [] for m in methods_to_eval}
+        
+        for rep in range(n_repeats):
+            print(f"\n{'='*60}")
+            print(f"REPETICIÓN {rep+1}/{n_repeats}")
+            print(f"{'='*60}")
+            rep_seed = rng.integers(0, 10**9)
+            rng_rep = np.random.default_rng(rep_seed)
+            
+            # Split 70/30
+            n = X_complete.shape[0]
+            idx = np.arange(n)
+            rng_rep.shuffle(idx)
+            n_tr = int((1 - test_size) * n)
+            idx_tr, idx_te = idx[:n_tr], idx[n_tr:]
+            X_tr_full = X_complete[idx_tr]
+            X_te_full = X_complete[idx_te]
+            y_tr_full = X_tr_full.copy()
+            y_te_full = X_te_full.copy()
+            
+            print(f"Split 70/30: train={X_tr_full.shape[0]}, test={X_te_full.shape[0]}")
+            
+            # Crear missing artificial
+            np.random.seed(rep_seed)
+            X_tr_miss = X_tr_full.copy()
+            msk_tr = np.random.random(X_tr_miss.shape) < missing_rate
+            X_tr_miss[msk_tr] = np.nan
+            
+            np.random.seed(rep_seed + 12345)
+            X_te_miss = X_te_full.copy()
+            msk_te = np.random.random(X_te_miss.shape) < missing_rate
+            X_te_miss[msk_te] = np.nan
+            
+            print(f"Missing: train={np.sum(np.isnan(X_tr_miss))}, test={np.sum(np.isnan(X_te_miss))}")
+            
+            # Por cada método
+            for mname in methods_to_eval:
+                try:
+                    print(f"\n--- {mname} (rep {rep+1}) ---")
+                    mname_low = mname.lower()
+                    if OPTUNA_AVAILABLE and mname in tune_methods:
+                        # Buscar mejores HP con solo train70 + inner CV
+                        best_params, best_score = self.tune_with_optuna(
+                            mname, X_tr_miss, y_tr_full,
+                            inner_cv_splits=inner_cv_splits,
+                            n_trials=n_trials_optuna,
+                            metric=metric,
+                            random_state=rep_seed
+                        )
+                        # Reentrenar con TODO train70 usando best_params
+                        imputer_final = self._build_imputer_with_params(mname, best_params)
+                    else:
+                        # Usar params por defecto
+                        imputer_final = self._build_imputer_with_params(mname, {})
+                    
+                    # Ajustar y evaluar en test30 (solo sobre NaN)
+                    is_transductive = isinstance(imputer_final, (GAIN, SoftImputeCustom, MissForestWrapper))
+                    scaler_te = MinMaxScaler()
+                    if is_transductive:
+                        X_tr_m_s = scaler_te.fit_transform(X_tr_miss)
+                        X_te_m_s = scaler_te.transform(X_te_miss)
+                        y_te_f_s = scaler_te.transform(y_te_full)
+                        X_te_imp_s = imputer_final.fit_transform(X_tr_m_s)  # fit sobre todo train escalado?
+                        # Mejor: para transductivos, aplicar fit_transform sobre train completo escalado
+                        # pero necesitamos imputar test; el wrapper/GAIN hacen fit_transform global
+                        # reconstruimos: entrenar sobre train escalado "completo"? 
+                        # estrategia: ajustar imputador sobre train escalado (fit_transform) para obtener estado? 
+                        # pero transductivos: aplicamos fit_transform sobre train escalado y transformamos test
+                        pass  # manejamos abajo
+                    # Evaluación final
+                    res_te = self._evaluate_final_holdout(imputer_final, X_tr_miss, X_te_miss, y_te_full)
+                    results_by_repeat[mname].append(res_te)
+                    print(f"TEST {metric}: {res_te.get(metric, np.nan):.4f} | MSE={res_te['mse']:.4f} MAE={res_te['mae']:.4f} R²={res_te['r2']:.4f}")
+                except Exception as e:
+                    print(f"Error en {mname} rep {rep+1}: {e}")
+                    results_by_repeat[mname].append({'mse': np.nan, 'mae': np.nan, 'r2': np.nan})
+        
+        # Calcular agregados
+        self.repeated_results = {
+            'by_repeat': results_by_repeat,
+            'n_repeats': n_repeats,
+            'aggregates': {}
+        }
+        for mname in methods_to_eval:
+            vals = results_by_repeat[mname]
+            if len(vals) == 0:
+                continue
+            mse_list = [v['mse'] for v in vals if not np.isnan(v['mse'])]
+            mae_list = [v['mae'] for v in vals if not np.isnan(v['mae'])]
+            r2_list = [v['r2'] for v in vals if not np.isnan(v['r2'])]
+            agg = {
+                'mean_mse': np.mean(mse_list) if mse_list else np.nan,
+                'std_mse': np.std(mse_list) if mse_list else np.nan,
+                'mean_mae': np.mean(mae_list) if mae_list else np.nan,
+                'std_mae': np.std(mae_list) if mae_list else np.nan,
+                'mean_r2': np.mean(r2_list) if r2_list else np.nan,
+                'std_r2': np.std(r2_list) if r2_list else np.nan,
+            }
+            self.repeated_results['aggregates'][mname] = agg
+        
+        return self.repeated_results
+    
+    def _evaluate_final_holdout(self, imputer_final, X_tr_miss, X_te_miss, y_te_full):
+        """
+        Reentrena con TODO train70 y evalúa en test30.
+        - Para no transductivos (SimpleImputer, IterativeImputer): fit pipeline completo sobre train70 -> transform test30
+        - Para transductivos (GAIN, SoftImputeCustom, MissForestWrapper): ajustar sobre train70 escalado (fit_transform) 
+          para obtener imputación consistente? luego transformar test30. 
+          Estrategia: escalar train/test con scaler ajustado en train; para transductivos aplicamos fit_transform sobre train escalado
+          y luego transformamos test escalado con el mismo imputador? Algunos transductivos no tienen transform separado puro;
+          usamos fit_transform sobre test escalado tras haber sido "entrenado" conceptualmente con train.
+        """
+        is_transductive = isinstance(imputer_final, (GAIN, SoftImputeCustom, MissForestWrapper))
+        scaler = MinMaxScaler()
+        X_tr_m_s = scaler.fit_transform(X_tr_miss)
+        X_te_m_s = scaler.transform(X_te_miss)
+        y_te_f_s = scaler.transform(y_te_full)
+        
+        if is_transductive:
+            # Para mantener coherencia: aplicar fit_transform sobre train escalado (refit con todo train)
+            try:
+                _ = imputer_final.fit_transform(X_tr_m_s)
+            except Exception:
+                pass
+            # Transformar test escalado
+            try:
+                X_te_imp_s = imputer_final.transform(X_te_m_s)
+            except Exception:
+                X_te_imp_s = imputer_final.fit_transform(X_te_m_s)
+        else:
+            pipe = Pipeline([
+                ('scaler', MinMaxScaler()),
+                ('imputer', imputer_final)
+            ])
+            pipe.fit(X_tr_miss)
+            X_te_imp = pipe.transform(X_te_miss)
+            scaler_p = pipe.named_steps['scaler']
+            y_te_f_s = scaler_p.transform(y_te_full)
+            X_te_imp_s = X_te_imp
+            scaler = scaler_p  # no usado
+        
+        msk_te = np.isnan(X_te_miss)
+        if not np.any(msk_te):
+            return {'mse': np.nan, 'mae': np.nan, 'r2': np.nan}
+        orig = y_te_f_s[msk_te]
+        impv = X_te_imp_s[msk_te]
+        return {
+            'mse': mean_squared_error(orig, impv),
+            'mae': mean_absolute_error(orig, impv),
+            'r2': r2_score(orig, impv) if len(np.unique(orig)) > 1 or True else np.nan
+        }
+    
+    def generate_repeated_holdout_report(self):
+        """
+        Genera reporte con resultados agregados del esquema repetido
+        """
+        if not hasattr(self, 'repeated_results'):
+            raise ValueError("Ejecuta run_experiment_repeated_holdout primero")
+        agg = self.repeated_results['aggregates']
+        rows = []
+        for mname, a in agg.items():
+            rows.append({
+                'Método': mname,
+                'MSE Media (test)': a['mean_mse'],
+                'MSE Std (test)': a['std_mse'],
+                'MAE Media (test)': a['mean_mae'],
+                'MAE Std (test)': a['std_mae'],
+                'R² Media (test)': a['mean_r2'],
+                'R² Std (test)': a['std_r2'],
+                'Repeticiones': self.repeated_results['n_repeats']
+            })
+        df = pd.DataFrame(rows).sort_values('MSE Media (test)')
+        print("\n" + "="*90)
+        print("RANKING HOLD-OUT 70/30 REPETIDO + OPTUNA (MÉTRICAS SOBRE TEST RESERVADO)")
+        print("="*90)
+        for i, (_, r) in enumerate(df.iterrows(), 1):
+            print(f"{i:2d}. {r['Método']:<20} | MSE={r['MSE Media (test)']:.4f}±{r['MSE Std (test)']:.4f} | R²={r['R² Media (test)']:.4f}±{r['R² Std (test)']:.4f}")
         return df
