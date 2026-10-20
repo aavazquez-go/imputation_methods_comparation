@@ -1,0 +1,35 @@
+# Dependencias del proyecto "imputation_methods_comparation"
+# Python 3.13 (probado con Python 3.13.16)
+#
+# Instalacion:
+#   python -m venv .venv
+#   source .venv/bin/activate   (Windows: .venv\Scripts\activate)
+#   pip install -r requeriments.txt
+
+# ---------------------------------------------------------
+# Dependencias obligatorias (usadas por todos los scripts)
+# ---------------------------------------------------------
+numpy==2.5.4
+pandas==3.0.6
+matplotlib==3.11.2
+seaborn==0.13.2
+scikit-learn==1.9.1
+fancyimpute==0.7.0
+
+# ---------------------------------------------------------
+# Dependencias opcionales
+# ---------------------------------------------------------
+# Optuna: solo para imputation_experiment_optuna.py y la
+# optimizacion de hiperparametros en clases.py
+optuna==5.0.0
+
+# TensorFlow/Keras: solo para los metodos de imputacion basados
+# en deep learning (autoencoders) definidos en clases.py
+tensorflow==2.21.0
+
+# Plotly: solo para graficos interactivos en clases.py
+plotly==7.1.0
+
+# Jupyter: solo para ejecutar el notebook
+# 01_imputation_method_selection_improved.ipynb
+notebook
