@@ -46,7 +46,10 @@ def main():
     print("=" * 60)
     
     # Cargar el dataset
-    df = pd.read_csv('/media/datos/WORKSPACE/DOCTORADO/phd_code/notebooks/experiments/df_encoded.csv')
+    df_path = '/media/datos/WORKSPACE/DOCTORADO/datasets/df_encoded.csv'
+    if not os.path.exists(df_path):
+        df_path = '/media/datos/WORKSPACE/DOCTORADO/phd_code/notebooks/experiments/df_encoded.csv'
+    df = pd.read_csv(df_path)
     # del df['Unnamed: 0']
     print(f"Main - Columnas del dataframe: {df.columns}")
     

@@ -320,6 +320,8 @@ class ImputationExperiment:
         self.random_state = random_state
         self.results = {}
         self.imputation_methods = {}
+        self.studies = {}               # {method_name: [study_rep1, study_rep2, ...]} (Optuna)
+        self.repeated_results = None    # Resultados del esquema hold-out repetido
         self.setup_imputers()
         
     def setup_imputers(self):
@@ -1038,6 +1040,11 @@ class ImputationExperiment:
         study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=rs))
         study.optimize(objective, n_trials=n_trials)
         
+        # Guardar study para gráficos de diagnóstico (historial, importancias, etc.)
+        if method_name not in self.studies:
+            self.studies[method_name] = []
+        self.studies[method_name].append(study)
+        
         best_params = study.best_params
         best_score = study.best_value
         if metric == 'r2':
@@ -1271,3 +1278,194 @@ class ImputationExperiment:
         for i, (_, r) in enumerate(df.iterrows(), 1):
             print(f"{i:2d}. {r['Método']:<20} | MSE={r['MSE Media (test)']:.4f}±{r['MSE Std (test)']:.4f} | R²={r['R² Media (test)']:.4f}±{r['R² Std (test)']:.4f}")
         return df
+
+    ## ------------------------------------
+    ## 4. Visualización de Resultados del Hold-Out Repetido y Optuna
+    ## ------------------------------------
+
+    def plot_repeated_holdout_boxplot(self, save_path=None):
+        """
+        FIGURA PRINCIPAL (para el paper): boxplot de las métricas de TEST reservado
+        por método, sobre todas las repeticiones del hold-out 70/30.
+        
+        Usa exclusivamente valores evaluados en el 30% de test nunca visto en
+        búsqueda ni reentrenamiento. Generado con matplotlib (sin dependencia Optuna).
+        """
+        if not self.repeated_results:
+            raise ValueError("Ejecuta run_experiment_repeated_holdout primero.")
+        
+        by_repeat = self.repeated_results['by_repeat']
+        methods = [m for m, v in by_repeat.items() if len(v) > 0]
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig.suptitle('Hold-out 70/30 repetido: métricas sobre TEST reservado',
+                     fontsize=15, fontweight='bold', color=COLORS['primary'])
+        
+        metric_specs = [
+            ('mse', 'MSE (menor mejor)', COLORS['primary']),
+            ('mae', 'MAE (menor mejor)', COLORS['accent']),
+            ('r2',  'R² (mayor mejor)',  COLORS['light_green']),
+        ]
+        
+        for ax, (key, title, color) in zip(axes, metric_specs):
+            data = [[v[key] for v in by_repeat[m] if not np.isnan(v[key])] for m in methods]
+            bp = ax.boxplot(data, patch_artist=True, showmeans=True,
+                            meanprops=dict(marker='D', markerfacecolor='black', markersize=5))
+            ax.set_xticklabels(methods, rotation=45, ha='right')
+            for patch in bp['boxes']:
+                patch.set_facecolor(color)
+                patch.set_alpha(0.6)
+            ax.set_title(title, fontweight='bold')
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+            print(f"Figura guardada en: {save_path}")
+        plt.show()
+        return fig
+
+    def plot_convergence_repetitions(self, metric='mse', save_path=None):
+        """
+        FIGURA DE JUSTIFICACIÓN METODOLÓGICA: media corrida de la métrica de TEST
+        frente al número de repeticiones, con banda de ±1.96·SE (IC 95%).
+        
+        Permite decidir/justificar si 5, 10 o 30 repeticiones son suficientes
+        (¿el resultado se estabiliza?). matplotlib puro, sin Optuna.
+        """
+        if not self.repeated_results:
+            raise ValueError("Ejecuta run_experiment_repeated_holdout primero.")
+        
+        by_repeat = self.repeated_results['by_repeat']
+        methods = [m for m, v in by_repeat.items() if len(v) > 0]
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        cmap = plt.get_cmap('tab10')
+        
+        for i, m in enumerate(methods):
+            vals = np.array([v[metric] for v in by_repeat[m] if not np.isnan(v[metric])])
+            if len(vals) == 0:
+                continue
+            reps = np.arange(1, len(vals) + 1)
+            running_mean = np.cumsum(vals) / reps
+            running_se = np.array([vals[:k].std(ddof=1) / np.sqrt(k) if k > 1 else np.nan
+                                   for k in reps])
+            ax.plot(reps, running_mean, 'o-', color=cmap(i % 10), label=m, linewidth=1.5)
+            ax.fill_between(reps, running_mean - 1.96 * running_se,
+                            running_mean + 1.96 * running_se,
+                            color=cmap(i % 10), alpha=0.15)
+        
+        ax.set_xlabel('Número de repeticiones (particiones 70/30)')
+        ax.set_ylabel(f'Media corrida de {metric.upper()} sobre TEST')
+        ax.set_title(f'Convergencia por repetición - {metric.upper()} (banda = IC 95%)',
+                     fontweight='bold', color=COLORS['primary'])
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+            print(f"Figura guardada en: {save_path}")
+        plt.show()
+        return fig
+
+    def _get_study(self, method_name, repeat_idx=-1):
+        """Auxiliar: recupera un study concreto de self.studies."""
+        if not OPTUNA_AVAILABLE:
+            raise RuntimeError("Optuna no disponible.")
+        if method_name not in self.studies or len(self.studies[method_name]) == 0:
+            raise ValueError(f"No hay studies guardados para '{method_name}'. "
+                             f"El método pudo no estar en tune_methods.")
+        return self.studies[method_name][repeat_idx]
+
+    def plot_optuna_history(self, method_name, repeat_idx=-1, save_path=None):
+        """
+        DIAGNÓSTICO DE BÚSQUEDA (anexo): historial de optimización de Optuna para un
+        método/repetición concretos. Muestra score por trial y mejor score hasta el momento
+        → permite justificar que n_trials fue suficiente (la curva se estanca).
+        
+        Usa plotly/optuna.visualization si está disponible (guarda HTML; PNG si kaleido
+        funciona); si no, usa fallback matplotlib construido desde study.trials.
+        """
+        study = self._get_study(method_name, repeat_idx)
+        
+        try:
+            import plotly
+            fig = optuna.visualization.plot_optimization_history(study)
+            fig.update_layout(title=f'Historial de optimización - {method_name} '
+                                    f'(repetición {repeat_idx})')
+            if save_path:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                html_path = os.path.splitext(save_path)[0] + '.html'
+                try:
+                    fig.write_html(html_path)
+                    print(f"Figura interactiva guardada en: {html_path}")
+                except Exception as e:
+                    print(f"No se pudo guardar HTML: {e}")
+                try:
+                    fig.write_image(save_path, scale=2)
+                    print(f"Figura guardada en: {save_path}")
+                except Exception as e:
+                    print(f"No se pudo exportar PNG (kaleido): {e}. Use el HTML.")
+            return fig
+        except ImportError:
+            pass
+        
+        # Fallback matplotlib (no requiere plotly)
+        trials = [t for t in study.trials if t.value is not None]
+        values = np.array([t.value for t in trials])
+        if study.direction == optuna.study.StudyDirection.MAXIMIZE:
+            best_so_far = np.maximum.accumulate(values)
+        else:
+            best_so_far = np.minimum.accumulate(values)
+        
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.scatter(range(1, len(values) + 1), values, alpha=0.5, label='Score por trial')
+        ax.plot(range(1, len(values) + 1), best_so_far, 'r-o', markersize=3,
+                label='Mejor hasta el momento')
+        ax.set_xlabel('Trial')
+        ax.set_ylabel('Score (CV interno)')
+        ax.set_title(f'Historial de optimización - {method_name} '
+                     f'(repetición {repeat_idx})', fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+            print(f"Figura guardada en: {save_path}")
+        plt.show()
+        return fig
+
+    def plot_optuna_param_importances(self, method_name, repeat_idx=-1, save_path=None):
+        """
+        DIAGNÓSTICO INTERNO (no recomendado para el paper): importancia de cada
+        hiperparámetro en el score de CV (fANOVA vía optuna.importance).
+        Útil para decidir rangos/espacio de búsqueda en corridas futuras.
+        """
+        study = self._get_study(method_name, repeat_idx)
+        
+        try:
+            importances = optuna.importance.get_param_importances(study)
+            names = list(importances.keys())
+            imps = list(importances.values())
+            
+            fig, ax = plt.subplots(figsize=(8, max(3, 0.5 * len(names))))
+            ax.barh(names[::-1], imps[::-1], color=COLORS['primary'], alpha=0.75)
+            ax.set_xlabel('Importancia relativa (fANOVA)')
+            ax.set_title(f'Importancia de hiperparámetros - {method_name} '
+                         f'(repetición {repeat_idx})', fontweight='bold')
+            ax.grid(True, alpha=0.3, axis='x')
+            plt.tight_layout()
+            if save_path:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+                print(f"Figura guardada en: {save_path}")
+            plt.show()
+            return fig
+        except Exception as e:
+            print(f"No se pudieron calcular importancias para {method_name}: {e}")
+            return None

@@ -48,12 +48,20 @@ def main():
     print("=" * 80)
     
     # Cargar el dataset
-    df_path = '/media/datos/WORKSPACE/DOCTORADO/phd_code/notebooks/experiments/df_encoded.csv'
+    df_path = '/media/datos/WORKSPACE/DOCTORADO/datasets/df_encoded.csv'
     if not os.path.exists(df_path):
-        # Intentar ruta relativa si existe
-        alt_path = 'df_encoded.csv'
-        if os.path.exists(alt_path):
-            df_path = alt_path
+        # Intentar rutas alternativas si existen
+        alt_paths = [
+            'df_encoded.csv',
+            '/media/datos/WORKSPACE/DOCTORADO/phd_code/notebooks/experiments/df_encoded.csv'
+        ]
+        found = None
+        for ap in alt_paths:
+            if os.path.exists(ap):
+                found = ap
+                break
+        if found is not None:
+            df_path = found
         else:
             print(f"AVISO: No se encontró {df_path}. Ajusta la ruta al dataset.")
     
@@ -66,6 +74,9 @@ def main():
     # Inicializar experimento
     experiment = ImputationExperiment(n_folds=5, random_state=42)
     
+    # Métodos que serán tuneados con Optuna (definido aquí para reutilizarlo en gráficos)
+    tune_methods_list = ['miss_forest', 'mice_hgb', 'soft_impute', 'gain']
+    
     try:
         # Ejecutar esquema propuesto por coautora
         results_repeated = experiment.run_experiment_repeated_holdout(
@@ -76,12 +87,52 @@ def main():
             n_repeats=5,             # Cambiar a 10/30 si tiempo lo permite
             inner_cv_splits=5,       # 5-CV interno para búsqueda
             n_trials_optuna=20,      # Reducido para pruebas rápidas; aumentar a 30
-            tune_methods=['miss_forest', 'mice_hgb', 'soft_impute', 'gain'],
+            tune_methods=tune_methods_list,
             metric='mse'
         )
         
         # Generar reporte
         results_df_rep = experiment.generate_repeated_holdout_report()
+        
+        # -----------------------------------------------
+        # Figuras para toma de decisiones / paper
+        # -----------------------------------------------
+        plots_dir = 'imputation_experiment_optuna/plots'
+        os.makedirs(plots_dir, exist_ok=True)
+        
+        # (1) FIGURA PRINCIPAL: boxplot de métricas de TEST por método (repeticiones)
+        try:
+            experiment.plot_repeated_holdout_boxplot(
+                save_path=f'{plots_dir}/boxplot_test_metrics.png')
+        except Exception as e:
+            print(f"No se pudo generar boxplot: {e}")
+        
+        # (2) JUSTIFICACIÓN METODOLÓGICA: convergencia por nº de repeticiones
+        try:
+            experiment.plot_convergence_repetitions(
+                metric='mse',
+                save_path=f'{plots_dir}/convergence_repetitions_mse.png')
+        except Exception as e:
+            print(f"No se pudo generar convergencia: {e}")
+        
+        # (3) DIAGNÓSTICO DE BÚSQUEDA (anexo): historial de Optuna por método tunado
+        #     (repetición -1 = última)
+        for mname in tune_methods_list:
+            try:
+                experiment.plot_optuna_history(
+                    mname, repeat_idx=-1,
+                    save_path=f'{plots_dir}/optuna_history_{mname}.png')
+            except Exception as e:
+                print(f"No se pudo generar historial Optuna para {mname}: {e}")
+        
+        # (4) DIAGNÓSTICO INTERNO: importancia de hiperparámetros (no para el paper)
+        for mname in tune_methods_list:
+            try:
+                experiment.plot_optuna_param_importances(
+                    mname, repeat_idx=-1,
+                    save_path=f'{plots_dir}/optuna_importances_{mname}.png')
+            except Exception as e:
+                print(f"No se pudieron generar importancias para {mname}: {e}")
         
         # Guardar resultados
         os.makedirs('imputation_experiment_optuna', exist_ok=True)
